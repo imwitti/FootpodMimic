@@ -1,0 +1,189 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+#include <math.h>
+#include <TM1637Display.h>
+
+const int buttonPin[] = {5,18,19};     // the number of the pushbutton pins
+//const int ledPin =  13;      // the number of the LED pin
+
+// variables will change:
+int buttonState = 0;         // variable for reading the pushbutton status
+bool        is_inst_stride_len_present = 1;                                 /**< True if Instantaneous Stride Length is present in the measurement. */
+bool        is_total_distance_present = 1;                                  /**< True if Total Distance is present in the measurement. */
+bool        is_running = 1;                                                 /**< True if running, False if walking. */
+uint16_t    inst_speed = 40;                                                 /**< Instantaneous Speed. */
+uint8_t     inst_cadence = 1;                                               /**< Instantaneous Cadence. */
+uint16_t    inst_stride_length = 1;                                         /**< Instantaneous Stride Length. */
+uint32_t    total_distance = 10;
+
+
+float kmphinterval = .5;
+float minorkmphinterval = .1;
+
+int delayint = 500;
+
+const int CLK = 22; //Set the CLK pin connection to the display
+const int DIO = 23; //Set the DIO pin connection to the display
+
+TM1637Display display(CLK, DIO);
+
+volatile unsigned int counter;
+int rpm;
+
+volatile long lastRiseTime = 0; //Time at which pin2 (interrupt 0) goes from LOW to HIGH
+
+volatile long firstButtonPress = 0;
+
+float kmph;
+float mps;
+float kmphStatic;
+
+byte fakePos[1] = {1};
+
+bool _BLEClientConnected = false;
+
+#define RSCService BLEUUID((uint16_t)0x1814)
+BLECharacteristic RSCMeasurementCharacteristics(BLEUUID((uint16_t)0x2A53), BLECharacteristic::PROPERTY_NOTIFY);
+BLECharacteristic sensorPositionCharacteristic(BLEUUID((uint16_t)0x2A5D), BLECharacteristic::PROPERTY_READ);
+
+BLEDescriptor RSCDescriptor(BLEUUID((uint16_t)0x2901));
+BLEDescriptor sensorPositionDescriptor(BLEUUID((uint16_t)0x2901));
+
+class MyServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      _BLEClientConnected = true;
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      _BLEClientConnected = false;
+    }
+};
+
+void InitBLE() {
+  BLEDevice::init("FootpodMimic");
+  // CBLE Server
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // Do some BLE Setup
+  BLEService *pRSC = pServer->createService(RSCService);
+
+  pRSC->addCharacteristic(&RSCMeasurementCharacteristics);
+  RSCDescriptor.setValue("Send all your RCSM rubbish here");
+  RSCMeasurementCharacteristics.addDescriptor(&RSCDescriptor);
+  RSCMeasurementCharacteristics.addDescriptor(new BLE2902());
+
+  pRSC->addCharacteristic(&sensorPositionCharacteristic);
+
+
+  pServer->getAdvertising()->addServiceUUID(RSCService);
+
+  pRSC->start();
+
+  pServer->getAdvertising()->start();
+}
+
+void setup() {
+  // initialize the LED pin as an output:
+  //pinMode(ledPin, OUTPUT);
+  // initialize the Serial Monitor @ 9600
+  Serial.begin(115200);
+  // initialize the keypad pin(s) as an input:
+  for(int x=0; x<3; x++)
+  {
+    pinMode(buttonPin[x], INPUT_PULLUP);
+  }
+Serial.print("started");
+
+InitBLE();
+display.setBrightness(0x0a);
+
+//some unrequired rubbish
+kmph = 8;
+kmphStatic = 0;
+mps = kmph/3.6;
+int initdisplay = 1234;
+display.showNumberDec(initdisplay);
+
+
+  delay(2000);
+}
+
+void loop(){
+
+  if ((millis() - lastRiseTime) > 500)
+ {
+   //debouncing
+
+  // read the state of the keypad value:
+  for(int x=0; x<3; x++)
+  {
+    //signifying the state of which the button is in by reading the appropriate pin #
+    buttonState = digitalRead(buttonPin[x]);
+
+    // check if the pushbutton on the keypad is pressed.
+    // if it is, the buttonState is LOW:
+    if (buttonState == LOW && buttonPin[x] == 19) {
+      // turn LED off:
+      Serial.print("pressed circle");
+      kmph = kmph+minorkmphinterval;
+      // digitalWrite(ledPin, LOW);
+    }
+    if (buttonState == LOW && buttonPin[x] == 18) {
+      // turn LED off:
+      Serial.print("UP *");
+      //digitalWrite(ledPin, LOW);
+      kmph = kmph+kmphinterval;
+    }
+    if (buttonState == LOW && buttonPin[x] == 5) {
+      // turn LED off:
+      Serial.print("Down *");
+      //digitalWrite(ledPin, LOW);
+      kmph = kmph-kmphinterval;
+    }
+  }
+if (kmph !=kmphStatic) {
+  kmphStatic = kmph;
+  //if i want to fluctuate rendomly here the add a rand 1or -1 to the above
+
+  //kmph = kmph+(random(-1, 1)/100);
+
+  mps=kmph/3.6;
+
+//kmph=8;
+//get speed ble ready
+  inst_speed =mps*256;
+  //inst_speed =rpm/210;
+  Serial.print("    Speed(mps):");
+  //kmph=mps*3.6;
+  Serial.print(mps);
+  Serial.println();
+  display.showNumberDec(kmph*100);
+  //potValue = analogRead(potPin);
+
+//Create the bytearray to send to Zwift via BLE
+  byte charArray[10] = {
+      3,
+      (unsigned byte)inst_speed, (unsigned byte)(inst_speed >> 8),
+      (unsigned byte)inst_cadence,
+      (unsigned byte)inst_stride_length, (unsigned byte)(inst_stride_length >> 8),
+      (unsigned byte)total_distance, (unsigned byte)(total_distance >> 8), (unsigned byte)(total_distance >> 16), (unsigned byte)(total_distance >> 24)};
+
+
+
+  RSCMeasurementCharacteristics.setValue(charArray,10);
+
+  RSCMeasurementCharacteristics.notify();
+
+  sensorPositionCharacteristic.setValue(fakePos, 1);
+  }
+  lastRiseTime = millis();
+}
+//counter++;
+
+
+//Serial.print(counter);
+}
